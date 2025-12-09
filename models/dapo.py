@@ -78,3 +78,9 @@ class DAPOAgent:
         old_policy.load_state_dict(self.policy.state_dict())
         old_policy.to(self.device)
         old_policy.eval()
+
+        all_response_ids = []
+        all_response_texts = []
+
+        self.policy.eval()
+        
