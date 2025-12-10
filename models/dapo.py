@@ -83,4 +83,123 @@ class DAPOAgent:
         all_response_texts = []
 
         self.policy.eval()
+        with torch.no_grad():
+            for i in range(len(prompts)):
+                response_ids, response_texts = self.policy.generate(
+                    prompt_ids[i:i+1],
+                    prompt_mask[i:i+1],
+                    max_length=config.max_length,
+                    num_return_sequences=G,
+                    do_sample=True
+                )
+                all_response_ids.append(response_ids)
+                all_response_texts.append(response_texts)
+        rewards, truncated = self.reward_model.compute_rewards(
+            prompts, all_response_texts, answer_keys
+        )
+        batch_samples = []
+        for i, (prompt_rewards, prompt_truncated, response_texts) in enumerate(zip(rewards, truncated, all_response_texts)):
+            valid_indices = [j for j, trunc in enumerate(prompt_truncated) if not trunc]
+            if not valid_indices:
+                continue
+            valid_rewards = [prompt_rewards[j] for j in valid_indices]
+            valid_responses = [response_texts[j] for j in valid_indices]
+            if all(r > 0 for r in valid_rewards) or all(r <= 0 for r in valid_rewards):
+                continue
+            batch_samples.append((i, valid_responses, valid_rewards))
+        if not batch_samples:
+            self.logger.warning("No prompts with variance in rewards - skipping update")
+            return {"loss": 0.0, "n_prompts": 0, "mean_reward": 0.0, "reward_std": 0.0}
+        self.policy.train()
+        old_policy.eval()
+        total_loss = 0.0
+        total_tokens = 0
+        total_reward = 0.0
+        rewards_list = []
+
+        for prompt_idx, responses, response_rewards in batch_samples:
+            mean_reward = np.mean(response_rewards)
+            std_reward = np.std(response_rewards) + 1e-8
+            for response_text, reward in zip(responses, response_rewards):
+                advantage = (reward - mean_reward) / std_reward
+                full_text = prompts[prompt_idx] + response_text
+                inputs = self.policy.tokenizer(
+                    full_text,
+                    return_tensors='pt',
+                    max_length=config.max_length,
+                    padding='max_length',
+                    truncation=True
+                ).to(self.device)
+
+                input_ids = input['input_ids']
+                attn_mask = input['attention_mask']
+
+                with torch.no_grad():
+                    old_log_probs = old_policy.get_token_logprobs(input_ids, attn_mask)
+                new_log_probs = self.policy.get_token_logprobs(input_ids, attn_mask)
+                prompt_length = len(self.policy.tokenizer.encode(prompts[prompt_idx]))
+
+                old_log_probs_response = old_log_probs[:, prompt_length-1:]
+                new_log_probs_response = new_log_probs[:, prompt_length-1:]
+                response_mask = attn_mask[:, prompt_length:]
+
+                ratio = torch.exp(new_log_probs_response - old_log_probs_response)
+
+                if advantage >= 0:
+                    ratio_clipped = torch.min(ratio, torch.tensor(1.0 + config.eps_high,device=self.device))
+                else:
+                    ratio_clipped = torch.max(ratio, torch.tensor(1.0 - config.eps_low, device=self.device))
+                token_loss = -torch.min(
+                    ratio * advantage,
+                    ratio_clipped * advantage
+                )
+                masked_token_loss = token_loss * response_mask
+                response_loss = masked_token_loss.sum()
+                n_tokens = response_mask.sum().item()
+                total_loss += response_loss
+                total_tokens += n_tokens
+                total_reward += reward
+                rewards_list.append(reward)
         
+        if total_tokens > 0:
+            loss = total_loss / total_tokens
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config.max_grad_norm)
+            self.optimizer.step()
+            self.optimizer.zero_grad()
+        else:
+            loss = torch.tensor(0.0, device=self.device)
+        
+        metrics = {
+            "loss": loss.item(),
+            "n_prompts": len(batch_samples),
+            "mean_reward": float(total_reward) / max(1, len(rewards_list)),
+            "reward_std": float(np.std(rewards_list)) if rewards_list else 0.
+        }
+        return metrics
+    
+    def save(self, save_dir: str) -> None:
+        """Save the DAPO agent.
+        
+        Args:
+            save_dir: Directory to save to.
+        """
+        self.policy.save(save_dir)
+    
+    @classmethod
+    def load(cls, load_dir: str,
+             reward_model: RewardModel,
+             config: DAPOConfig) -> 'DAPOAgent':
+        """Load a DAPO agent from a directory.
+        
+        Args:
+            load_dir: Directory to load from.
+            reward_model: Reward model to use.
+            config: Configuration for the DAPO algorithm.
+            
+        Returns:
+            Loaded DAPOAgent instance.
+        """
+        policy_model = PolicyModel.load(load_dir)
+        return cls(policy_model, reward_model, config)
+
